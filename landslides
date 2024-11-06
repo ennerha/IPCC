@@ -1,0 +1,192 @@
+# Instalar pacote rasterio se necessário
+!pip install rasterio
+
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.plot import show
+import matplotlib.cm as cm
+import os
+import pandas as pd
+
+# Função para normalizar dados entre 0 e 1
+def normalize(data):
+    return (data - np.min(data)) / (np.max(data) - np.min(data))
+
+# Função para normalizar precipitação usando log
+def normalize_precipitation(precip):
+    return np.log1p(precip)  # Log preserva valores altos
+
+# Função para calcular a suscetibilidade ajustada
+def calc_susceptibility(base_map, variables, precipitation, weight_factors):
+    susc = base_map.copy()
+
+    for i, var in enumerate(variables):
+        var[var < 0] = 0  # Define valores negativos como zero
+        var = normalize(var)  # Normaliza entre 0 e 1
+        susc += weight_factors[i] * var
+
+    precipitation = normalize_precipitation(precipitation)  # Normaliza a precipitação
+    susc *= precipitation
+
+    susc[susc < 0] = 0
+    susc = normalize(susc)  # Normaliza a suscetibilidade final entre 0 e 1
+
+    return susc
+
+# Função para salvar o mapa de suscetibilidade como GeoTIFF
+def save_map_as_tif(data, save_path, reference_raster_path):
+    # Abrir o raster de referência para obter o perfil (metadados) e transformações
+    with rasterio.open(reference_raster_path) as src:
+        profile = src.profile
+        profile.update(dtype=rasterio.float32, count=1)
+
+        # Salvar o novo arquivo TIFF
+        with rasterio.open(save_path, 'w', **profile) as dst:
+            dst.write(data.astype(rasterio.float32), 1)
+
+# Função para plotar o mapa de suscetibilidade
+def plot_map(data, title, cmap, vmin, vmax, save_path=None, save_tif_path=None, reference_raster=None):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cax = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    fig.colorbar(cax, ax=ax, label='Value')
+
+    # Salvar o mapa em PNG, se o caminho foi fornecido
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    plt.show()
+
+    # Salvar o mapa como GeoTIFF se o caminho foi fornecido
+    if save_tif_path and reference_raster:
+        save_map_as_tif(data, save_tif_path, reference_raster)
+
+# Função para carregar arquivos raster
+def load_raster(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File {file_path} not found.")
+    with rasterio.open(file_path) as src:
+        return src.read(1)
+
+# Função para cortar arrays para o menor tamanho
+def crop_arrays_to_min_shape(arrays):
+    min_rows = min(array.shape[0] for array in arrays)
+    min_cols = min(array.shape[1] for array in arrays)
+    cropped_arrays = [array[:min_rows, :min_cols] for array in arrays]
+    return cropped_arrays
+
+# Pesos ajustáveis para cada camada
+weight_factors = [0.1, 0.15, 0.1, 0.1, 0.2, 0.15, 0.2]
+
+# Carregar mapa de suscetibilidade base
+base_susceptibility = load_raster('mapa_susceptibilid.tif')
+
+# Carregar camadas variáveis
+variable_files = [
+    'SMI.tif', 'Slope_Degree.tif', 'Saturation.tif', 'Relief_Dissection.tif',
+    'Geomorphology.tif', 'Geology.tif', 'TPI.tif'
+]
+variable_layers = [load_raster(file) for file in variable_files]
+
+# Carregar camadas de precipitação (atualizado)
+precip_files = [
+    'MERGE_CPTEC_20230217_Project.tif', 'MERGE_CPTEC_20230218_Project.tif',
+    'MERGE_CPTEC_20230219_Project.tif'
+]
+precip_layers = [load_raster(file) for file in precip_files]
+
+# Carregar camada LULC
+lulc_map = load_raster('LULC_2023.tif')
+
+# Combinar todos os arrays para determinar o menor tamanho
+all_arrays = [base_susceptibility] + variable_layers + precip_layers + [lulc_map]
+cropped_arrays = crop_arrays_to_min_shape(all_arrays)
+
+# Desempacotar os arrays cortados
+base_susceptibility_cropped = cropped_arrays[0]
+variable_layers_cropped = cropped_arrays[1:len(variable_layers)+1]
+precip_layers_cropped = cropped_arrays[len(variable_layers)+1:-1]
+lulc_layer_cropped = cropped_arrays[-1]
+
+# Cenários IPCC para ajuste de precipitação
+ipcc_scenarios = {
+    'RCP2.6': 1.0,
+    'RCP4.5': 1.2,
+    'RCP6.0': 1.4,
+    'RCP8.5': 1.6
+}
+
+# Inicializar DataFrame para importância das variáveis
+importance_df = pd.DataFrame(columns=['Scenario', 'Day', 'Variable', 'Importance'])
+
+# Nomes das variáveis
+variable_names = ['SMI', 'Slope', 'Saturation', 'Relief Dissection', 'Geomorphology', 'Geology', 'TPI']
+
+# Nomes das classes LULC (removendo a classe 'Água')
+lulc_class_names = {
+    1: 'Forest',
+    2: 'Agriculture',
+    3: 'Urban',
+    5: 'Pasture'
+}
+
+# Gerar mapas de suscetibilidade e calcular importância das variáveis
+for scenario, factor in ipcc_scenarios.items():
+    for i, precip_layer in enumerate(precip_layers_cropped):
+        adjusted_precip = precip_layer * (factor + np.random.uniform(-0.2, 0.2))
+
+        if np.max(adjusted_precip) > 500:
+            weight_factors_extreme = [w * 1.5 for w in weight_factors]
+        else:
+            weight_factors_extreme = weight_factors
+
+        susceptibility_map = calc_susceptibility(base_susceptibility_cropped, variable_layers_cropped, adjusted_precip, weight_factors_extreme)
+
+        cmap = cm.get_cmap('coolwarm')
+        plot_title = f'Susceptibility to Landslides - {scenario} - Day {i+1}'
+        png_save_path = f'susceptibility_map_{scenario}_day{i+1}.png'
+        tif_save_path = f'susceptibility_map_{scenario}_day{i+1}.tif'
+        reference_raster_path = 'mapa_susceptibilid.tif'  # Usar o mapa de suscetibilidade base como referência
+
+        # Salvar o mapa tanto como PNG quanto como GeoTIFF
+        plot_map(susceptibility_map, plot_title, cmap, vmin=0, vmax=1, save_path=png_save_path, save_tif_path=tif_save_path, reference_raster=reference_raster_path)
+
+        # Calcular a importância das variáveis
+        importance_rows = []
+        for j, var in enumerate(variable_layers_cropped):
+            normalized_var = normalize(var)
+            importance = weight_factors_extreme[j] * np.mean(normalized_var) * factor
+            importance_rows.append({'Scenario': scenario, 'Day': i + 1, 'Variable': variable_names[j], 'Importance': importance})
+
+        importance_df = pd.concat([importance_df, pd.DataFrame(importance_rows)], ignore_index=True)
+
+# Plotar importância das variáveis
+for scenario in ipcc_scenarios.keys():
+    for day in range(1, len(precip_layers_cropped) + 1):
+        day_importance = importance_df[(importance_df['Scenario'] == scenario) & (importance_df['Day'] == day)]
+        if not day_importance.empty:
+            plt.figure(figsize=(10, 6))
+            plt.bar(day_importance['Variable'], day_importance['Importance'], color='lightblue')
+            plt.title(f'Variable Importance - {scenario} - Day {day}')
+            plt.xlabel('Variable')
+            plt.ylabel('Importance')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.show()
+
+# Influência das classes LULC na suscetibilidade
+lulc_importance_df = pd.DataFrame(columns=['Scenario', 'Day', 'LULC_Class', 'Influence'])
+
+for scenario, factor in ipcc_scenarios.items():
+    for i, precip_layer in enumerate(precip_layers_cropped):
+        adjusted_precip = precip_layer * (factor + np.random.uniform(-0.2, 0.2))
+        susceptibility_map = calc_susceptibility(base_susceptibility_cropped, variable_layers_cropped, adjusted_precip, weight_factors_extreme)
+
+        for lulc_class, lulc_value in lulc_class_names.items():
+            lulc_mask = lulc_layer_cropped == lulc_class
+            lulc_susceptibility = susceptibility_map[lulc_mask]
+            lulc_influence = np.mean(lulc_susceptibility)
+            lulc_importance_df = pd.concat([lulc_importance_df, pd.DataFrame({
+                'Scenario': [scenario], 'Day': [i + 1],
+                'LULC_Class': [lulc_value], 'Influence': [lulc_influence]
+            })], ignore_index=True)
